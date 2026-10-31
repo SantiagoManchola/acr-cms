@@ -95,10 +95,22 @@ async function doDel() {
   const p = pendingDel.value
   if (!p) return
   await accionRun(async () => {
-    if (p.tipo === 'sus') { await mm.deleteSuscriptor(p.id); await mm.loadSuscriptores(soloNoVacios(filtrosSus.value), pageSus.value, ordenSus.value, dirSus.value) }
+    if (p.tipo === 'sus') {
+      await mm.deleteSuscriptor(p.id)
+      await Promise.all([
+        mm.loadSuscriptores(soloNoVacios(filtrosSus.value), pageSus.value, ordenSus.value, dirSus.value),
+        mm.loadSuscriptoresOpciones(),
+      ])
+    }
     else if (p.tipo === 'sec') { await mm.deleteSector(p.id); await cargarSectores() }
     else if (p.tipo === 'lec') { await mm.deleteLectura(p.id); await mm.loadLecturas(soloNoVacios(filtrosLec.value), pageLec.value, ordenLec.value, dirLec.value) }
-    else { await mm.deleteMicromedidor(p.id); await mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value, ordenMm.value, dirMm.value) }
+    else {
+      await mm.deleteMicromedidor(p.id)
+      await Promise.all([
+        mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value, ordenMm.value, dirMm.value),
+        mm.loadMicromedidoresOpciones(),
+      ])
+    }
     confirmShow.value = false
     pendingDel.value = null
   })
@@ -109,6 +121,9 @@ function refreshAll() {
     mm.loadSuscriptores(soloNoVacios(filtrosSus.value), pageSus.value),
     mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value),
     mm.loadLecturas(soloNoVacios(filtrosLec.value), pageLec.value),
+    // La lista de opciones alimenta el buscador de «Registrar lectura»:
+    // si se cambió/inactivó un medidor, debe refrescarse junto con la tabla.
+    mm.loadMicromedidoresOpciones(),
   ])
 }
 
@@ -265,11 +280,13 @@ async function saveSus() {
 }
 async function delSus(r) { askDel('sus', r) }
 async function reactivarSus(r) {
-  await accionRun(async () => {
-    await mm.updateSuscriptor(r.id, { estado: 'activo' })
-    await mm.loadSuscriptores(soloNoVacios(filtrosSus.value), pageSus.value, ordenSus.value, dirSus.value)
-    await mm.loadSuscriptoresOpciones()
-  })
+  // El botón del template ya envuelve la acción en accionRun(): aquí NO se
+  // vuelve a usar (useBusy ignora la segunda llamada y la acción no corría).
+  await mm.updateSuscriptor(r.id, { estado: 'activo' })
+  await Promise.all([
+    mm.loadSuscriptores(soloNoVacios(filtrosSus.value), pageSus.value, ordenSus.value, dirSus.value),
+    mm.loadSuscriptoresOpciones(),
+  ])
 }
 
 /* ---------------- Sectores (catálogo, solo admin) ---------------- */
@@ -303,10 +320,9 @@ async function saveSec() {
 }
 async function delSec(r) { askDel('sec', r) }
 async function reactivarSec(r) {
-  await accionRun(async () => {
-    await mm.updateSector(r.id, { estado: 'activo' })
-    await cargarSectores()
-  })
+  // Ver nota en reactivarSus: un solo envoltorio de busy (el del template).
+  await mm.updateSector(r.id, { estado: 'activo' })
+  await cargarSectores()
 }
 
 /* ---------------- Micromedidores ---------------- */
@@ -336,15 +352,23 @@ async function saveMm() {
     if (editingMm.value) delete payload.suscriptor_id // un medidor no cambia de suscriptor
     if (editingMm.value) await mm.updateMicromedidor(editingMm.value.id, payload)
     else await mm.createMicromedidor(payload)
-    showMm.value = false; await mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value)
+    showMm.value = false
+    // Refrescar también las opciones del buscador de lecturas: si se creó un
+    // medidor nuevo o se editó uno existente, debe verse de inmediato.
+    await Promise.all([
+      mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value),
+      mm.loadMicromedidoresOpciones(),
+    ])
   } catch (e) { mmError.value = apiError(e) } finally { saving.value = false }
 }
 async function delMm(r) { askDel('mm', r) }
 async function reactivarMm(r) {
-  await accionRun(async () => {
-    await mm.updateMicromedidor(r.id, { estado: 'activo' })
-    await mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value, ordenMm.value, dirMm.value)
-  })
+  // Ver nota en reactivarSus: un solo envoltorio de busy (el del template).
+  await mm.updateMicromedidor(r.id, { estado: 'activo' })
+  await Promise.all([
+    mm.loadMicromedidores(soloNoVacios(filtrosMm.value), pageMm.value, ordenMm.value, dirMm.value),
+    mm.loadMicromedidoresOpciones(),
+  ])
 }
 
 /* Visor de evidencias fotográficas (miniaturas en tablas -> foto grande) */
@@ -585,6 +609,17 @@ function onPickMedidorUnico(val) {
   const op = (mm.opcionesMedidores || []).find((m) => m.id === val)
   lecForm.value.suscriptor_id = op?.suscriptor_id ?? null
 }
+/* Si el medidor elegido deja de estar activo (p. ej. se inactivó mientras el
+   modal estaba abierto), se limpia la selección para no guardar una lectura
+   contra un medidor viejo. El backend igual la rechazaría. */
+watch(lecMmOptions, (opts) => {
+  const id = lecForm.value.micromedidor_id
+  if (id && !opts.some((o) => o.value === id)) {
+    lecForm.value.micromedidor_id = null
+    lecForm.value.suscriptor_id = null
+    mm.lecturaAnterior = null
+  }
+})
 
 /* Lectura ANTERIOR del medidor elegido: se consulta apenas se selecciona el
    medidor para mostrarla ANTES de guardar (verificar la previa y detectar
@@ -628,12 +663,21 @@ const lecGuardarMsg = computed(() => {
   return `El valor escrito (${fmtNum(v, 0)}) es IGUAL al de la lectura anterior del ${a?.fecha ?? '—'}. Puede ser que el medidor esté frenado (no pasó agua) o que sea un registro duplicado. ¿Guardar de todos modos?`
 })
 const lecNovedadVisible = ref(false)
-function openNewLec() {
+async function openNewLec() {
   lecForm.value = emptyLec()
   lecError.value = ''
   lecNovedadVisible.value = false
+  mm.lecturaAnterior = null
+  // Vaciar la lista antes de abrir: mientras llega la respuesta fresca (solo
+  // medidores activos) no se debe mostrar el medidor viejo desde una lista
+  // cacheada. El modal abre de inmediato y la lista se llena al responder.
+  mm.opcionesMedidores = []
   showLec.value = true
-  if (!mm.opcionesMedidores?.length) mm.loadMicromedidoresOpciones()
+  try {
+    await mm.loadMicromedidoresOpciones()
+  } catch (e) {
+    lecError.value = apiError(e)
+  }
 }
 /* Guardas anti-duplicadas/errores antes de guardar (el backend revalida:
    defensa en profundidad). Devuelven false si no se debe guardar. */
